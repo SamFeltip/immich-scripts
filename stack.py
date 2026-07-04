@@ -17,8 +17,13 @@ Overview
    become "stacks", so a stack can contain more than two images (e.g.
    A~B and B~C produces a single 3-image stack even if A and C are not
    directly similar enough).
-5. Either print what *would* be stacked (``--dry-run``) or call the
-   Immich API to create the stacks.
+5. Within each stack, pick the "primary" asset: the image with the
+   highest ``exifInfo.rating``, falling back to the highest resolution
+   (``exifImageWidth * exifImageHeight``) as a tie-breaker (including
+   when no image in the stack has a rating at all).
+6. Either print what *would* be stacked (``--dry-run``) or call the
+   Immich API to create the stacks, with the chosen primary asset
+   listed first.
 
 Usage
 -----
@@ -269,6 +274,23 @@ class ImmichClient:
         logger.info("Album '%s' contains %d assets (%d images).", album.get("albumName"), len(assets), len(images))
         return images
 
+    def get_asset(self, asset_id: str) -> Dict:
+        """
+        Fetch full asset detail, including ``exifInfo`` (rating, pixel
+        dimensions, etc.). The asset objects embedded in an album payload
+        are sometimes a slimmer projection, so this is used whenever
+        rating/resolution data is required.
+
+        :param asset_id: Immich asset id.
+        :type asset_id: str
+        :return: Full asset JSON.
+        :rtype: dict
+        :raises requests.HTTPError: If the asset cannot be fetched.
+        """
+        resp = self.session.get(self._url(f"/assets/{asset_id}"), timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     def download_thumbnail(self, asset_id: str, size: str = "preview") -> bytes:
         """
         Download a thumbnail image for the given asset.
@@ -293,9 +315,11 @@ class ImmichClient:
         """
         Create a stack containing the given assets.
 
-        :param asset_ids: Asset ids to group into a single stack. The
-            first id is conventionally treated as the stack's primary
-            asset by Immich.
+        :param asset_ids: Asset ids to group into a single stack, in the
+            desired order. Immich treats the first id as the stack's
+            primary asset, so callers should pass the highest-rated /
+            highest-resolution asset first (see
+            :func:`order_stack_by_rating_and_resolution`).
         :type asset_ids: Sequence[str]
         :raises requests.HTTPError: If the API rejects the request.
         """
@@ -447,6 +471,71 @@ def cluster_by_similarity(embeddings: np.ndarray, threshold: float) -> List[List
     return clusters
 
 
+def order_stack_by_rating_and_resolution(client: ImmichClient, members: List[Dict]) -> List[Dict]:
+    """
+    Reorder a cluster's assets so the "best" one is first.
+
+    Immich treats the first id in a stack's asset list as the stack's
+    primary asset, so this picks the primary using, in priority order:
+
+    1. Highest ``exifInfo.rating`` (assets with no rating are treated as
+       the lowest possible rating, so any rated image outranks an
+       unrated one).
+    2. Highest resolution (``exifImageWidth * exifImageHeight``) as a
+       tie-breaker when ratings are equal (including when none of the
+       images in the stack are rated).
+
+    :param client: Configured :class:`ImmichClient`, used to fetch full
+        asset detail (``exifInfo`` is not always present on the slimmer
+        asset objects embedded in an album listing).
+    :type client: ImmichClient
+    :param members: Asset dicts belonging to one cluster/stack.
+    :type members: list[dict]
+    :return: The same assets, sorted best-first (highest rating, then
+        highest resolution).
+    :rtype: list[dict]
+    """
+    scored: List[Tuple[int, int, Dict]] = []
+
+    for asset in members:
+        try:
+            detail = client.get_asset(asset["id"])
+        except Exception as exc:  # noqa: BLE001 - fall back to unscored placement rather than failing the stack
+            logger.warning("Could not fetch exif detail for %s: %s", asset.get("originalFileName", asset["id"]), exc)
+            detail = asset
+
+        exif = detail.get("exifInfo") or {}
+        rating = exif.get("rating")
+        rating_score = rating if isinstance(rating, (int, float)) else -1
+
+        width = exif.get("exifImageWidth") or 0
+        height = exif.get("exifImageHeight") or 0
+        resolution_score = width * height
+
+        scored.append((rating_score, resolution_score, asset))
+        logger.debug(
+            "  candidate %s: rating=%s resolution=%dx%d",
+            asset.get("originalFileName", asset["id"]),
+            rating if rating is not None else "none",
+            width,
+            height,
+        )
+
+    # Sort descending by (rating, resolution); Python's sort is stable so
+    # ties beyond that keep their original (cluster) order.
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    best_rating, best_resolution, best_asset = scored[0]
+    logger.info(
+        "  primary: %s (rating=%s, resolution=%d px)",
+        best_asset.get("originalFileName", best_asset["id"]),
+        best_rating if best_rating != -1 else "none",
+        best_resolution,
+    )
+
+    return [item[2] for item in scored]
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -550,18 +639,27 @@ def run(config: Config, album_identifier: str, strictness: float, dry_run: bool,
 
     logger.info("Found %d candidate stack(s).", len(clusters))
     for cluster in clusters:
-        names = [kept_assets[i].get("id", kept_assets[i]["id"]) for i in cluster]
-        asset_ids = [kept_assets[i]["id"] for i in cluster]
+        members = [kept_assets[i] for i in cluster]
+        names = [a.get("originalFileName", a["id"]) for a in members]
+        logger.info("Ranking primary asset for stack: %s", ", ".join(names))
+
+        ordered_members = order_stack_by_rating_and_resolution(client, members)
+        ordered_ids = [a["id"] for a in ordered_members]
+        ordered_names = [a.get("originalFileName", a["id"]) for a in ordered_members]
 
         if dry_run:
-            logger.info("[DRY RUN] Would stack %d images: %s", len(cluster), ", ".join(names))
+            logger.info(
+                "[DRY RUN] Would stack %d images (primary first): %s",
+                len(ordered_ids),
+                ", ".join(ordered_names),
+            )
             continue
 
         try:
-            client.create_stack(asset_ids)
-            logger.info("Stacked %d images: %s", len(cluster), ", ".join(names))
+            client.create_stack(ordered_ids)
+            logger.info("Stacked %d images (primary first): %s", len(ordered_ids), ", ".join(ordered_names))
         except Exception as exc:  # noqa: BLE001 - keep going with remaining stacks
-            logger.error("Failed to create stack for %s: %s", ", ".join(names), exc)
+            logger.error("Failed to create stack for %s: %s", ", ".join(ordered_names), exc)
 
     logger.info("Done.")
 
