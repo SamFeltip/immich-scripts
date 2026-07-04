@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from tensorflow.keras.applications.mobilenet import preprocess_input
 
 import requests
 import numpy as np
@@ -77,10 +78,25 @@ def load_model() -> tf.keras.Model:
     """
     Load the NIMA model.
 
+    The .h5 file shipped with the neural-image-assessment repo contains
+    weights only (no architecture/config), so we build the MobileNet-based
+    NIMA architecture ourselves and load the weights into it.
+
     :return: TensorFlow model
     """
     logger.info("Loading NIMA model...")
-    model = tf.keras.models.load_model(NIMA_MODEL_PATH, compile=False)
+
+    base_model = tf.keras.applications.MobileNet(
+        input_shape=(224, 224, 3),
+        include_top=False,
+        pooling="avg",
+        weights=None,
+    )
+    x = tf.keras.layers.Dropout(0.75)(base_model.output)
+    x = tf.keras.layers.Dense(10, activation="softmax")(x)
+    model = tf.keras.Model(base_model.input, x)
+
+    model.load_weights(NIMA_MODEL_PATH)
     logger.info("Model loaded.")
     return model
 
@@ -94,7 +110,8 @@ def preprocess(image_bytes: bytes) -> np.ndarray:
     """
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     img = img.resize((224, 224))
-    arr = np.array(img) / 255.0
+    arr = np.array(img).astype("float32")
+    arr = preprocess_input(arr)
     return np.expand_dims(arr, axis=0)
 
 
@@ -161,14 +178,19 @@ def download_thumbnail(asset_id: str) -> Optional[bytes]:
     return res.content
 
 
-def update_rating(asset_id: str, rating: int) -> None:
+def update_rating(asset_id: str, rating: int, dryrun: bool) -> None:
     """
     Update asset rating in Immich.
 
     :param asset_id: Asset ID
     :param rating: Star rating
+    :param dryrun: Perform a dry run without updating ratings
     """
     url = f"{IMMICH_BASE_URL}/assets/{asset_id}"
+    if dryrun:
+        logger.info(f"[Dry Run] Would update {asset_id} to {rating}★")
+        return
+    
     res = requests.patch(url, headers=HEADERS, json={"rating": rating})
 
     if res.status_code not in (200, 204):
@@ -183,7 +205,8 @@ def update_rating(asset_id: str, rating: int) -> None:
 def process_asset(
     asset: Dict[str, Any],
     model: tf.keras.Model,
-    overwrite: bool
+    overwrite: bool,
+    dryrun: bool
 ) -> None:
     """
     Process a single asset.
@@ -191,6 +214,7 @@ def process_asset(
     :param asset: Asset dict
     :param model: NIMA model
     :param overwrite: Overwrite existing ratings
+    :param dryrun: Perform a dry run without updating ratings
     """
     asset_id: Optional[str] = asset.get("id")
     rating: Optional[int] = asset.get("rating")
@@ -211,7 +235,7 @@ def process_asset(
         stars = to_stars(score)
 
         logger.info(f"{asset_id} -> {score:.2f} ({stars}★)")
-        update_rating(asset_id, stars)
+        update_rating(asset_id, stars, dryrun)
 
     except Exception as e:
         logger.exception(f"Error processing {asset_id}: {e}")
@@ -222,12 +246,13 @@ def process_asset(
 # =======================
 
 
-def run(album_id: str, overwrite: bool) -> None:
+def run(album_id: str, overwrite: bool, dryrun: bool) -> None:
     """
     Run full pipeline.
 
     :param album_id: Album ID
     :param overwrite: Overwrite existing ratings
+    :param dryrun: Perform a dry run without updating ratings
     """
     logger.info("Starting run")
     logger.info(f"Album: {album_id}")
@@ -244,7 +269,7 @@ def run(album_id: str, overwrite: bool) -> None:
 
             for asset in batch:
                 futures.append(
-                    executor.submit(process_asset, asset, model, overwrite)
+                    executor.submit(process_asset, asset, model, overwrite, dryrun)
                 )
 
         for _ in tqdm(as_completed(futures), total=len(futures)):
@@ -266,7 +291,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Overwrite existing ratings"
     )
+    parser.add_argument(
+        "--dryrun",
+        action="store_true",
+        help="Perform a dry run without updating ratings"
+    )
 
     args = parser.parse_args()
 
-    run(album_id=args.album_id, overwrite=args.overwrite)
+    run(album_id=args.album_id, overwrite=args.overwrite, dryrun=args.dryrun)
