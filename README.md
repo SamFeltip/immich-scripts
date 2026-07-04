@@ -1,6 +1,6 @@
 # immich scripts
 
-this is a repo of scripts that use the immich api to turn albums into containers for [photos.samfelton.com](photos.samfelton.com).
+this is a repo of scripts that use the immich api to turn albums into containers for [photos.samfelton.com](https://photos.samfelton.com).
 
 ## rate.py
 
