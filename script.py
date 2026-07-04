@@ -228,7 +228,7 @@ def get_assets(album_id: str) -> List[Dict[str, Any]]:
     :param album_id: Album ID
     :return: List of assets
     """
-    url = f"{IMMICH_BASE_URL}/albums/{album_id}"
+    url = f"{IMMICH_BASE_URL}/api/albums/{album_id}"
     logger.info(f"Fetching assets from album {album_id}")
 
     res = requests.get(url, headers=HEADERS)
@@ -246,7 +246,7 @@ def download_thumbnail(asset_id: str) -> Optional[bytes]:
     :param asset_id: Asset ID
     :return: Image bytes or None
     """
-    url = f"{IMMICH_BASE_URL}/assets/{asset_id}/thumbnail"
+    url = f"{IMMICH_BASE_URL}/api/assets/{asset_id}/thumbnail"
     res = requests.get(url, headers=HEADERS)
 
     if res.status_code != 200:
@@ -267,7 +267,7 @@ def get_people_count(asset_id: str) -> int:
     :param asset_id: Asset ID
     :return: Count of identified people, 0 on failure
     """
-    url = f"{IMMICH_BASE_URL}/assets/{asset_id}"
+    url = f"{IMMICH_BASE_URL}/api/assets/{asset_id}"
     res = requests.get(url, headers=HEADERS)
 
     if res.status_code != 200:
@@ -286,7 +286,7 @@ def update_rating(asset_id: str, rating: int, dryrun: bool) -> None:
     :param rating: Star rating
     :param dryrun: Perform a dry run without updating ratings
     """
-    url = f"{IMMICH_BASE_URL}/assets/{asset_id}"
+    url = f"{IMMICH_BASE_URL}/api/assets/{asset_id}"
     if dryrun:
         return
 
