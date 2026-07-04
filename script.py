@@ -1,10 +1,16 @@
 import os
+
+# Keep TensorFlow's own C++ / retracing chatter out of the console before
+# tensorflow is even imported.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
 import argparse
 import logging
+import threading
+from collections import deque
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from tensorflow.keras.applications.mobilenet import preprocess_input
 
 import requests
 import numpy as np
@@ -12,6 +18,10 @@ from PIL import Image
 from tqdm import tqdm
 import tensorflow as tf
 from dotenv import load_dotenv
+
+# Silence tensorflow's own logger (this is what was emitting the
+# "N out of the last N calls ... triggered tf.function retracing" spam).
+tf.get_logger().setLevel("ERROR")
 
 # =======================
 # ENV / CONFIG
@@ -69,6 +79,58 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+class ScrollingLogDisplay:
+    """
+    Renders a fixed progress bar plus a scrolling window of the last N
+    log lines beneath it, so multi-threaded workers don't stomp on each
+    other's output or the progress bar.
+
+    Implemented as one "real" tqdm progress bar plus N text-only tqdm
+    bars pinned to fixed screen positions below it. Each new message
+    pushes into a deque and the fixed positions are redrawn from it.
+    """
+
+    def __init__(self, total: int, max_lines: int = 20, desc: str = "Processing") -> None:
+        self._lock = threading.Lock()
+        self.max_lines = max_lines
+        self.lines: deque = deque(maxlen=max_lines)
+
+        self.bar = tqdm(total=total, position=0, desc=desc, leave=True)
+        self._line_bars = [
+            tqdm(total=0, position=i + 1, bar_format="{desc}", leave=False)
+            for i in range(max_lines)
+        ]
+
+    def log(self, message: str) -> None:
+        """
+        Push a new log line into the scrolling window.
+
+        :param message: Line to display
+        """
+        with self._lock:
+            self.lines.append(message)
+            for i, line_bar in enumerate(self._line_bars):
+                text = self.lines[i] if i < len(self.lines) else ""
+                line_bar.set_description_str(text)
+                line_bar.refresh()
+
+    def advance(self, n: int = 1) -> None:
+        """
+        Advance the main progress bar.
+
+        :param n: Number of steps to advance
+        """
+        with self._lock:
+            self.bar.update(n)
+
+    def close(self) -> None:
+        """Tear down all bars cleanly."""
+        for line_bar in self._line_bars:
+            line_bar.close()
+        self.bar.close()
+
+
 # =======================
 # MODEL
 # =======================
@@ -110,8 +172,7 @@ def preprocess(image_bytes: bytes) -> np.ndarray:
     """
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     img = img.resize((224, 224))
-    arr = np.array(img).astype("float32")
-    arr = preprocess_input(arr)
+    arr = np.array(img) / 255.0
     return np.expand_dims(arr, axis=0)
 
 
@@ -121,7 +182,7 @@ def predict_score(model: tf.keras.Model, tensor: np.ndarray) -> float:
 
     :param model: NIMA model
     :param tensor: Image tensor
-    :return: Score (1–10)
+    :return: Score (1-10)
     """
     preds = model.predict(tensor, verbose=0)[0]
     scores = np.arange(1, 11)
@@ -130,12 +191,29 @@ def predict_score(model: tf.keras.Model, tensor: np.ndarray) -> float:
 
 def to_stars(score: float) -> int:
     """
-    Convert NIMA score to 1–5 stars.
+    Convert NIMA score to 1-5 stars.
 
-    :param score: Score (1–10)
-    :return: Stars (1–5)
+    :param score: Score (1-10)
+    :return: Stars (1-5)
     """
     return int(np.clip(round(score / 2), 1, 5))
+
+
+def apply_people_boost(stars: int, people_count: int) -> int:
+    """
+    Boost a star rating based on how many identified people are in the shot.
+
+    :param stars: Base star rating (1-5)
+    :param people_count: Number of identified (named) people in the asset
+    :return: Boosted star rating, clamped to 5
+    """
+    if people_count > 4:
+        boost = 2
+    elif people_count >= 1:
+        boost = 1
+    else:
+        boost = 0
+    return int(np.clip(stars + boost, 1, 5))
 
 
 # =======================
@@ -178,6 +256,28 @@ def download_thumbnail(asset_id: str) -> Optional[bytes]:
     return res.content
 
 
+def get_people_count(asset_id: str) -> int:
+    """
+    Fetch the number of identified (named) people in an asset.
+
+    Immich's asset-detail endpoint returns a `people` array containing only
+    faces that have been assigned to a named person; unrecognized/unassigned
+    faces are excluded, which is what we want for this boost.
+
+    :param asset_id: Asset ID
+    :return: Count of identified people, 0 on failure
+    """
+    url = f"{IMMICH_BASE_URL}/assets/{asset_id}"
+    res = requests.get(url, headers=HEADERS)
+
+    if res.status_code != 200:
+        logger.warning(f"Could not fetch people info for {asset_id}")
+        return 0
+
+    people = res.json().get("people", [])
+    return len(people)
+
+
 def update_rating(asset_id: str, rating: int, dryrun: bool) -> None:
     """
     Update asset rating in Immich.
@@ -188,9 +288,8 @@ def update_rating(asset_id: str, rating: int, dryrun: bool) -> None:
     """
     url = f"{IMMICH_BASE_URL}/assets/{asset_id}"
     if dryrun:
-        logger.info(f"[Dry Run] Would update {asset_id} to {rating}★")
         return
-    
+
     res = requests.put(url, headers=HEADERS, json={"rating": rating})
 
     if res.status_code not in (200, 204):
@@ -206,7 +305,8 @@ def process_asset(
     asset: Dict[str, Any],
     model: tf.keras.Model,
     overwrite: bool,
-    dryrun: bool
+    dryrun: bool,
+    display: ScrollingLogDisplay,
 ) -> None:
     """
     Process a single asset.
@@ -215,18 +315,22 @@ def process_asset(
     :param model: NIMA model
     :param overwrite: Overwrite existing ratings
     :param dryrun: Perform a dry run without updating ratings
+    :param display: Shared scrolling log/progress display
     """
     asset_id: Optional[str] = asset.get("id")
     rating: Optional[int] = asset.get("rating")
 
     if not asset_id:
+        display.advance()
         return
 
     if rating is not None and not overwrite:
+        display.advance()
         return
 
     img = download_thumbnail(asset_id)
     if not img:
+        display.advance()
         return
 
     try:
@@ -234,11 +338,26 @@ def process_asset(
         score = predict_score(model, tensor)
         stars = to_stars(score)
 
-        logger.info(f"{asset_id} -> {score:.2f} ({stars}★)")
-        update_rating(asset_id, stars, dryrun)
+        people_count = get_people_count(asset_id)
+        final_stars = stars
+
+        # final_stars = apply_people_boost(stars, people_count)
+
+        if people_count > 0:
+            display.log(
+                f"{asset_id} -> {score:.2f} ({stars}★) "
+                f"+{final_stars - stars} for {people_count} people = {final_stars}★"
+            )
+        else:
+            display.log(f"{asset_id} -> {score:.2f} ({final_stars}★)")
+
+        update_rating(asset_id, final_stars, dryrun)
 
     except Exception as e:
+        display.log(f"Error processing {asset_id}: {e}")
         logger.exception(f"Error processing {asset_id}: {e}")
+    finally:
+        display.advance()
 
 
 # =======================
@@ -261,6 +380,8 @@ def run(album_id: str, overwrite: bool, dryrun: bool) -> None:
     model = load_model()
     assets = get_assets(album_id)
 
+    display = ScrollingLogDisplay(total=len(assets), desc="Rating assets")
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
 
@@ -269,12 +390,13 @@ def run(album_id: str, overwrite: bool, dryrun: bool) -> None:
 
             for asset in batch:
                 futures.append(
-                    executor.submit(process_asset, asset, model, overwrite, dryrun)
+                    executor.submit(process_asset, asset, model, overwrite, dryrun, display)
                 )
 
-        for _ in tqdm(as_completed(futures), total=len(futures)):
+        for _ in as_completed(futures):
             pass
 
+    display.close()
     logger.info("Completed.")
 
 
