@@ -191,7 +191,7 @@ def update_rating(asset_id: str, rating: int, dryrun: bool) -> None:
         logger.info(f"[Dry Run] Would update {asset_id} to {rating}★")
         return
     
-    res = requests.patch(url, headers=HEADERS, json={"rating": rating})
+    res = requests.put(url, headers=HEADERS, json={"rating": rating})
 
     if res.status_code not in (200, 204):
         logger.error(f"Failed to update {asset_id}: {res.text}")
